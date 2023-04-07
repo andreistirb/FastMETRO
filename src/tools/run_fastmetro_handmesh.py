@@ -36,13 +36,14 @@ from src.utils.logger import setup_logger
 from src.utils.comm import is_main_process, get_rank, get_world_size
 from src.utils.miscellaneous import mkdir, set_seed
 from src.utils.metric_logger import AverageMeter
-from src.utils.geometric_layers import orthographic_projection
+from src.utils.geometric_layers import orthographic_projection, rodrigues, mat2rodrigues
 from src.utils.renderer_opendr import OpenDR_Renderer, visualize_reconstruction_opendr, visualize_reconstruction_multi_view_opendr
 try:
     from src.utils.renderer_pyrender import PyRender_Renderer, visualize_reconstruction_pyrender, visualize_reconstruction_multi_view_pyrender
 except:
     print("Failed to import renderer_pyrender. Please see docs/Installation.md")
      
+from tqdm import tqdm
 
 def save_checkpoint(model, args, epoch, iteration, num_trial=10):
     checkpoint_dir = op.join(args.output_dir, 'checkpoint-{}-{}'.format(
@@ -100,7 +101,19 @@ def vertices_loss(criterion_vertices, pred_vertices, gt_vertices, has_mesh, devi
     else:
         return torch.FloatTensor(1).fill_(0.).to(device) 
 
-
+def smpl_param_loss(criterion_smpl, pred_rotmat, pred_betas, gt_pose, gt_betas, has_smpl, device):
+    """
+    Compute smpl parameter loss if smpl annotations are available.
+    """
+    pred_rotmat_with_shape = pred_rotmat[has_smpl == 1].view(-1, 3, 3)
+    pred_betas_with_shape = pred_betas[has_smpl == 1]
+    gt_rotmat_with_shape = gt_pose[has_smpl == 1].view(-1, 3, 3)
+    gt_betas_with_shape = gt_betas[has_smpl == 1]
+    if len(gt_rotmat_with_shape) > 0:
+        loss = criterion_smpl(pred_rotmat_with_shape, gt_rotmat_with_shape) + 0.1 * criterion_smpl(pred_betas_with_shape, gt_betas_with_shape)
+    else:
+        loss = torch.FloatTensor(1).fill_(0.).to(device) 
+    return loss
 class EdgeLengthGTLoss(torch.nn.Module):
     """
     Modified from [I2L-MeshNet](https://github.com/mks0601/I2L-MeshNet_RELEASE/blob/master/common/nets/loss.py)
@@ -172,7 +185,7 @@ class NormalVectorLoss(torch.nn.Module):
 def run_train(args, train_dataloader, FastMETRO_model, mano_model, mesh_sampler, renderer):    
     max_iter = len(train_dataloader)
     iters_per_epoch = max_iter // args.num_train_epochs
-    args.logging_steps = iters_per_epoch // 2
+    # args.logging_steps = iters_per_epoch // 2
     iteration = args.resume_epoch * iters_per_epoch
 
     FastMETRO_model_without_ddp = FastMETRO_model
@@ -203,6 +216,8 @@ def run_train(args, train_dataloader, FastMETRO_model, mano_model, mesh_sampler,
     criterion_2d_keypoints = torch.nn.L1Loss(reduction='none').cuda(args.device)
     criterion_3d_keypoints = torch.nn.L1Loss(reduction='none').cuda(args.device)
     criterion_3d_vertices = torch.nn.L1Loss().cuda(args.device)
+    if args.use_smpl_param_regressor:
+        criterion_smpl_param = torch.nn.MSELoss().cuda(args.device)
     
     # define loss functions for edge length & normal vector
     edge_gt_loss = EdgeLengthGTLoss(mano_model.face)
@@ -216,7 +231,14 @@ def run_train(args, train_dataloader, FastMETRO_model, mano_model, mesh_sampler,
     log_loss_edge_normal = AverageMeter()
     log_loss_2d_joints = AverageMeter()
 
-    for _, (img_keys, images, annotations) in enumerate(train_dataloader):
+    if args.use_smpl_param_regressor:
+        log_smpl_loss = AverageMeter()
+        log_smpl_3d_joints = AverageMeter()
+        log_smpl_3d_vertices = AverageMeter()
+        log_smpl_edge_normal = AverageMeter()
+        log_smpl_2d_joints = AverageMeter()
+
+    for _, (img_keys, images, annotations) in enumerate(tqdm(train_dataloader)):
         FastMETRO_model.train()
         iteration = iteration + 1
         epoch = iteration // iters_per_epoch
@@ -227,6 +249,13 @@ def run_train(args, train_dataloader, FastMETRO_model, mano_model, mesh_sampler,
         # gt 2d joints
         gt_2d_joints = annotations['joints_2d'].cuda(args.device)
         gt_pose = annotations['pose'].cuda(args.device)
+        gt_pose = torch.reshape(gt_pose, (batch_size, 16, 3))
+        gt_pose_rotmat_list = []
+        for i in range(batch_size):
+            pose_slice_rotmat = rodrigues(gt_pose[i])
+            gt_pose_rotmat_list.append(pose_slice_rotmat)
+        gt_pose = torch.stack(gt_pose_rotmat_list)
+
         gt_betas = annotations['betas'].cuda(args.device)
         has_mesh = annotations['has_smpl'].cuda(args.device)
         has_3d_joints = has_mesh.clone()
@@ -284,12 +313,34 @@ def run_train(args, train_dataloader, FastMETRO_model, mano_model, mesh_sampler,
                args.edge_normal_loss_weight * loss_edge_normal + \
                args.joints_2d_loss_weight * loss_2d_joints)
 
+        if args.use_smpl_param_regressor:
+            pred_rotmat, pred_betas = out['pred_rotmat'], out['pred_betas']
+            pred_smpl_3d_vertices, pred_smpl_3d_joints = mano_model.layer(pred_rotmat, pred_betas) # batch_size X 778 X 3, batch_size x 21 x3
+            pred_smpl_3d_joints_root = pred_smpl_3d_joints[:,cfg.J_NAME.index('Wrist'),:]
+            pred_smpl_3d_vertices = pred_smpl_3d_vertices - pred_smpl_3d_joints_root[:, None, :] # batch_size X 6890 X 3
+            pred_smpl_3d_joints = pred_smpl_3d_joints - pred_smpl_3d_joints_root[:, None, :] # batch_size X 14 X 3
+            pred_smpl_2d_joints = orthographic_projection(pred_smpl_3d_joints, pred_cam.clone().detach()) # batch_size X 14 X 2
+            
+            loss_smpl_3d_joints = keypoint_3d_loss(criterion_3d_keypoints, pred_smpl_3d_joints, gt_3d_joints_with_tag, has_3d_joints, args.device)
+            loss_smpl_2d_joints = keypoint_2d_loss(criterion_2d_keypoints, pred_smpl_2d_joints, gt_2d_joints, has_2d_joints)
+            loss_smpl_vertices = vertices_loss(criterion_3d_vertices, pred_smpl_3d_vertices, gt_3d_vertices_fine, has_mesh, args.device)
+            # compute smpl parameter loss
+            loss_smpl = smpl_param_loss(criterion_smpl_param, pred_rotmat, pred_betas, gt_pose, gt_betas, has_mesh, args.device) + loss_smpl_3d_joints + loss_smpl_2d_joints + loss_smpl_vertices
+            loss = (args.smpl_param_loss_weight * loss_smpl) + loss
+            loss = 0.1 * loss
+
         # update logs
         log_loss_3d_joints.update(loss_3d_joints.item(), batch_size)
         log_loss_3d_vertices.update(loss_3d_vertices.item(), batch_size)
         log_loss_edge_normal.update(loss_edge_normal.item(), batch_size)
         log_loss_2d_joints.update(loss_2d_joints.item(), batch_size)
         log_losses.update(loss.item(), batch_size)
+
+        if args.use_smpl_param_regressor:
+            log_smpl_3d_joints.update(loss_smpl_3d_joints.item(), batch_size)
+            log_smpl_3d_vertices.update(loss_smpl_vertices.item(), batch_size)
+            log_smpl_2d_joints.update(loss_smpl_2d_joints.item(), batch_size)
+            log_smpl_loss.update(loss_smpl.item(), batch_size)
 
         # back-propagation
         optimizer.zero_grad()
@@ -310,12 +361,31 @@ def run_train(args, train_dataloader, FastMETRO_model, mano_model, mesh_sampler,
                     log_losses.avg, log_loss_3d_joints.avg, log_loss_3d_vertices.avg, log_loss_edge_normal.avg, log_loss_2d_joints.avg,
                     optimizer.param_groups[0]['lr'])
             )
+            if args.use_smpl_param_regressor:
+                logger.info(
+                    ' '.join(
+                    ['epoch: {ep}', 'iterations: {iter}',]
+                    ).format(ep=epoch, iter=iteration,) 
+                    + ' SMPL loss: {:.4f}, 3D-joint-loss: {:.4f}, 3D-vertex-loss: {:.4f}, 2D-joint-loss: {:.4f}, lr: {:.6f}'.format(
+                        log_smpl_loss.avg, log_smpl_3d_joints.avg, log_smpl_3d_vertices.avg, log_smpl_2d_joints.avg,
+                        optimizer.param_groups[0]['lr'])
+                )
             # visualize estimation results during training
             if args.visualize_training and (iteration >= args.logging_steps):
-                visual_imgs = visualize_mesh(renderer,
-                                            annotations['ori_img'].detach(),
-                                            pred_3d_vertices_fine.detach(), 
-                                            pred_cam.detach())
+                if args.use_smpl_param_regressor:
+                    visual_imgs = visualize_mesh(renderer,
+                                                annotations['ori_img'].detach(),
+                                                pred_3d_vertices_fine.detach(), 
+                                                pred_cam.detach())
+                    visual_imgs_smpl = visualize_mesh(renderer,
+                                                annotations['ori_img'].detach(),
+                                                pred_smpl_3d_vertices.detach(), 
+                                                pred_cam.detach())
+                else:
+                    visual_imgs = visualize_mesh(renderer,
+                                                annotations['ori_img'].detach(),
+                                                pred_3d_vertices_fine.detach(), 
+                                                pred_cam.detach())
                 visual_imgs = visual_imgs.transpose(0,1)
                 visual_imgs = visual_imgs.transpose(1,2)
                 visual_imgs = np.asarray(visual_imgs)
@@ -325,6 +395,17 @@ def run_train(args, train_dataloader, FastMETRO_model, mano_model, mesh_sampler,
                     if args.use_opendr_renderer:
                         visual_imgs[:,:,::-1] = visual_imgs[:,:,::-1]*255
                     cv2.imwrite(temp_fname, np.asarray(visual_imgs[:,:,::-1]))
+
+                if args.use_smpl_param_regressor:
+                    visual_imgs_smpl = visual_imgs_smpl.transpose(0,1)
+                    visual_imgs_smpl = visual_imgs_smpl.transpose(1,2)
+                    visual_imgs_smpl = np.asarray(visual_imgs_smpl)
+                    if is_main_process():
+                        stamp = str(epoch) + '_' + str(iteration)
+                        temp_fname = args.output_dir + 'visual_smpl_' + stamp + '.jpg'
+                        if args.use_opendr_renderer:
+                            visual_imgs_smpl[:,:,::-1] = visual_imgs_smpl[:,:,::-1]*255
+                        cv2.imwrite(temp_fname, np.asarray(visual_imgs_smpl[:,:,::-1]))
 
         # save checkpoint
         if (iteration % iters_per_epoch) == 0:
@@ -383,6 +464,16 @@ def run_inference_hand_mesh(args, val_loader, FastMETRO_model, mano_model, rende
             # normalize predicted joints 
             pred_3d_joints_from_mano = pred_3d_joints_from_mano - pred_3d_joints_from_mano_wrist[:, None, :]
             
+            if args.use_smpl_param_regressor:
+                pred_rotmat, pred_betas = out['pred_rotmat'], out['pred_betas']
+
+                pred_smpl_3d_vertices, pred_smpl_3d_joints = mano_model.layer(pred_rotmat, pred_betas) # batch_size X 778 X 3, batch_size x 21 x3
+                pred_smpl_3d_joints_root = pred_smpl_3d_joints[:,cfg.J_NAME.index('Wrist'),:]
+                pred_smpl_3d_vertices = pred_smpl_3d_vertices - pred_smpl_3d_joints_root[:, None, :] # batch_size X 6890 X 3
+                pred_smpl_3d_joints = pred_smpl_3d_joints - pred_smpl_3d_joints_root[:, None, :] # batch_size X 14 X 3
+                pred_3d_vertices_fine = pred_smpl_3d_vertices
+                pred_3d_joints_from_mano = pred_smpl_3d_joints
+
             for j in range(batch_size):
                 fname_output_save.append(img_keys[j])
                 pred_3d_vertices_list = pred_3d_vertices_fine[j].tolist()
@@ -481,7 +572,7 @@ def parse_args():
                         help="Batch size per GPU/CPU for training.")
     parser.add_argument("--per_gpu_eval_batch_size", default=16, type=int, 
                         help="Batch size per GPU/CPU for evaluation.")
-    parser.add_argument('--lr', "--learning_rate", default=1e-4, type=float, 
+    parser.add_argument('--lr', "--learning_rate", default=1e-5, type=float, 
                         help="The initial lr.")
     parser.add_argument('--lr_backbone', default=1e-4, type=float)
     parser.add_argument('--lr_drop', default=200, type=int)
@@ -499,6 +590,7 @@ def parse_args():
     parser.add_argument("--vertices_coarse_loss_weight", default=0.50, type=float)
     parser.add_argument("--edge_gt_loss_weight", default=1.0, type=float) 
     parser.add_argument("--normal_loss_weight", default=0.1, type=float)
+    parser.add_argument("--smpl_param_loss_weight", default=1.0, type=float)
     # Model parameters
     parser.add_argument("--model_name", default='FastMETRO-L', type=str,
                         help='Transformer architecture: FastMETRO-S, FastMETRO-M, FastMETRO-L')
@@ -510,6 +602,8 @@ def parse_args():
     parser.add_argument("--transformer_dropout", default=0.1, type=float)
     parser.add_argument("--transformer_nhead", default=8, type=int)
     parser.add_argument("--pos_type", default='sine', type=str)    
+    parser.add_argument("--use_smpl_param_regressor", default=False, action='store_true',) 
+
     # CNN backbone
     parser.add_argument('-a', '--arch', default='hrnet-w64',
                         help='CNN backbone architecture: hrnet-w64, resnet50')

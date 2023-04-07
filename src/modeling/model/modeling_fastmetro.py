@@ -13,7 +13,7 @@ import numpy as np
 from torch import nn
 from .transformer import build_transformer
 from .position_encoding import build_position_encoding
-from .smpl_param_regressor import build_smpl_parameter_regressor
+from .smpl_param_regressor import build_smpl_parameter_regressor, build_mano_parameter_regressor
 
 class FastMETRO_Body_Network(nn.Module):
     """FastMETRO for 3D human pose and mesh reconstruction from a single RGB image"""
@@ -221,6 +221,8 @@ class FastMETRO_Hand_Network(nn.Module):
         temp_mask_1 = (adjacency_matrix == 0)
         temp_mask_2 = torch.cat([zeros_1, temp_mask_1], dim=1)
         self.attention_mask = torch.cat([zeros_2, temp_mask_2], dim=0)
+        if args.use_smpl_param_regressor:
+            self.smpl_parameter_regressor = build_mano_parameter_regressor()
     
     def forward(self, images):
         device = images.device
@@ -263,5 +265,11 @@ class FastMETRO_Hand_Network(nn.Module):
         out['pred_3d_joints'] = pred_3d_joints
         out['pred_3d_vertices_coarse'] = pred_3d_vertices_coarse
         out['pred_3d_vertices_fine'] = pred_3d_vertices_fine
+
+        # (optional) regress smpl parameters
+        if self.args.use_smpl_param_regressor:
+            pred_rotmat, pred_betas = self.smpl_parameter_regressor(pred_3d_vertices_fine.clone().detach())
+            out['pred_rotmat'] = pred_rotmat
+            out['pred_betas'] = pred_betas
 
         return out

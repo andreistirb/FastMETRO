@@ -53,6 +53,45 @@ class SMPL_Parameter_Regressor(nn.Module):
         pred_rotmat = pred_rotmat.to(device)
 
         return pred_rotmat, pred_betas
+    
+class MANO_Parameter_Regressor(nn.Module):
+    """MANO Parameter Regressor"""
+    def __init__(self):
+        super().__init__()
+        self.regressor = nn.Sequential(FCBlock(778*3, 1024),
+                                        FCResBlock(1024, 1024),
+                                        FCResBlock(1024, 1024),
+                                        nn.Linear(1024, 16*3*3+10))
+    
+    def forward(self, pred_vertices):
+        """Forward pass.
+        Input:
+            vertices (from non-parametric): size = (batch_size, num_vertices, 3)
+        Returns:
+            MANO pose parameters as rotation matrices: size = (batch_size, 16, 3, 3)
+            MANO shape parameters: size = (batch_size, 10)
+        """
+        device = pred_vertices.device
+        batch_size = pred_vertices.size(0)
+
+        rotmat_beta = self.regressor(pred_vertices.reshape(batch_size, 778*3))
+        rotmat = rotmat_beta[:, :16*3*3].view(-1, 16, 3, 3).contiguous()
+        pred_betas = rotmat_beta[:, 16*3*3:].contiguous()
+        
+        # rotmat = rotmat.view(-1, 3, 3).contiguous()
+        # rotmat =  rotmat.cpu()
+        # U, S, V = batch_svd(rotmat)
+        # rotmat = torch.matmul(U, V.transpose(1,2))
+        # det = torch.zeros(rotmat.shape[0], 1, 1).to(rotmat.device)
+        # with torch.no_grad():
+        #     for i in range(rotmat.shape[0]):
+        #         det[i] = torch.det(rotmat[i])
+        # pred_rotmat = rotmat * det
+        # pred_rotmat = pred_rotmat.view(batch_size, 16, 3, 3)
+        # pred_rotmat = pred_rotmat.to(device)
+
+        # return pred_rotmat, pred_betas
+        return rotmat, pred_betas
 
 
 class FCBlock(nn.Module):
@@ -102,3 +141,6 @@ def batch_svd(A):
 
 def build_smpl_parameter_regressor():
     return SMPL_Parameter_Regressor()
+
+def build_mano_parameter_regressor():
+    return MANO_Parameter_Regressor()

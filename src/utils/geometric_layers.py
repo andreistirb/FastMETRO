@@ -11,6 +11,29 @@ Parts of the code are taken from https://github.com/MandyMo/pytorch_HMR
 
 import torch
 
+def mat2rodrigues(R):
+    """
+    Convert rotation matrix to axis-angle representation.
+    Args:
+        R: size = [B, 3, 3], rotation matrix
+    Returns:
+        Axis-angle representation of the rotation matrix -- size = [B, 3]
+    """
+    eps = torch.finfo(R.dtype).eps
+    cos_theta = (torch.diagonal(R.transpose(1, 2), offset=0, dim1=1, dim2=2).sum(dim=1) - 1) / 2.0
+    cos_theta = torch.clamp(cos_theta, -1.0 + eps, 1.0 - eps)
+    theta = torch.acos(cos_theta)
+    mask = theta.new_zeros(theta.shape[0], dtype=torch.bool)
+    mask[theta < eps] = 1
+    vec = torch.zeros_like(R[:, 0, :])
+    vec[~mask] = (1 / (2 * torch.sin(theta[~mask])) *
+                  torch.stack((R[:, 2, 1] - R[:, 1, 2],
+                               R[:, 0, 2] - R[:, 2, 0],
+                               R[:, 1, 0] - R[:, 0, 1]), dim=1)[~mask])
+    vec[mask] = torch.tensor([0.0, 0.0, 1.0], device=R.device)
+    theta = theta.unsqueeze(-1)
+    return vec * theta
+
 def rodrigues(theta):
     """Convert axis-angle representation to rotation matrix.
     Args:
