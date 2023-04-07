@@ -316,8 +316,11 @@ def run_train(args, train_dataloader, FastMETRO_model, mano_model, mesh_sampler,
         if args.use_smpl_param_regressor:
             pred_rotmat, pred_betas = out['pred_rotmat'], out['pred_betas']
             pred_smpl_3d_vertices, pred_smpl_3d_joints = mano_model.layer(pred_rotmat, pred_betas) # batch_size X 778 X 3, batch_size x 21 x3
+            pred_smpl_3d_vertices = pred_smpl_3d_vertices / 1000
+            pred_smpl_3d_joints = pred_smpl_3d_joints / 1000
+
             pred_smpl_3d_joints_root = pred_smpl_3d_joints[:,cfg.J_NAME.index('Wrist'),:]
-            pred_smpl_3d_vertices = pred_smpl_3d_vertices - pred_smpl_3d_joints_root[:, None, :] # batch_size X 6890 X 3
+            pred_smpl_3d_vertices = pred_smpl_3d_vertices - pred_smpl_3d_joints_root[:, None, :] # batch_size X 778 X 3
             pred_smpl_3d_joints = pred_smpl_3d_joints - pred_smpl_3d_joints_root[:, None, :] # batch_size X 14 X 3
             pred_smpl_2d_joints = orthographic_projection(pred_smpl_3d_joints, pred_cam.clone().detach()) # batch_size X 14 X 2
             
@@ -327,7 +330,7 @@ def run_train(args, train_dataloader, FastMETRO_model, mano_model, mesh_sampler,
             # compute smpl parameter loss
             loss_smpl = smpl_param_loss(criterion_smpl_param, pred_rotmat, pred_betas, gt_pose, gt_betas, has_mesh, args.device) + loss_smpl_3d_joints + loss_smpl_2d_joints + loss_smpl_vertices
             loss = (args.smpl_param_loss_weight * loss_smpl) + loss
-            loss = 0.1 * loss
+            # loss = 0.1 * loss
 
         # update logs
         log_loss_3d_joints.update(loss_3d_joints.item(), batch_size)
